@@ -28,10 +28,32 @@ run_query_with_retries() {
     done
 }
 
+search_table() {
+    local DB_NAME=$1
+    local table=$2
+    local search_string=$3
+    local result_file=$4
+
+    log "Searching in table: $table (Database: $DB_NAME)"
+
+    search_query="PREPARE search_query(text) AS SELECT * FROM $table WHERE to_jsonb($table)::text LIKE '%' || \$1 || '%';"
+    run_query_with_retries "$search_query"
+    result=$(run_query_with_retries "EXECUTE search_query('$search_string');")
+    psql -h $DB_HOST -U $DB_USER -d $DB_NAME -c "DEALLOCATE search_query;" 2>>$LOG_FILE
+
+    echo "Results for table $table (Database: $DB_NAME):" | tee -a $result_file
+    echo "$result" | tee -a $result_file
+    echo "--------------------------------------" | tee -a $result_file
+}
+
+export -f run_query_with_retries log search_table
+
 echo "Enter the search string:"
 read search_string
 
-DBS=("platform" "commonsvcs" "operationsmanager" "lcm" "domainmanager")
+DB_HOST="localhost"
+DB_USER="postgres"
+DBS=("platform" "commonsvcs" "operationsmanager" "lcm" "domainmanager" "sddc-manager-ui-app")
 RESULT_FILE_PREFIX="/tmp/JOsearch_result_"
 
 for DB_NAME in "${DBS[@]}"; do
@@ -46,16 +68,9 @@ for DB_NAME in "${DBS[@]}"; do
     result_file="${RESULT_FILE_PREFIX}${DB_NAME}_$(date +"%Y%m%d%H%M%S").txt"
     touch $result_file
 
-    for table in $tables; do
-        log "Searching in table: $table (Database: $DB_NAME)"
+    # Export required variables for parallel processing
+    export DB_NAME DB_HOST DB_USER
 
-        search_query="PREPARE search_query(text) AS SELECT * FROM $table WHERE to_tsvector('english', to_jsonb($table)) @@ plainto_tsquery('english', \$1);"
-        run_query_with_retries "$search_query"
-        result=$(run_query_with_retries "EXECUTE search_query('$search_string');")
-        psql -h $DB_HOST -U $DB_USER -d $DB_NAME -c "DEALLOCATE search_query;" 2>>$LOG_FILE
-
-        echo "Results for table $table (Database: $DB_NAME):" | tee -a $result_file
-        echo "$result" | tee -a $result_file
-        echo "--------------------------------------" | tee -a $result_file
-    done
+    # Use GNU parallel to search tables concurrently
+    printf '%s\n' "${tables[@]}" | parallel -j 4 --no-notice search_table "$DB_NAME" "{}" "$search_string" "$result_file"
 done
