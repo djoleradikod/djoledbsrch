@@ -1,0 +1,61 @@
+#!/bin/bash
+
+LOG_FILE="/tmp/JOsearch_db.log"
+
+log() {
+    echo "$(date +"%Y-%m-%d %H:%M:%S") - $1" | tee -a $LOG_FILE
+}
+
+run_query_with_retries() {
+    local query=$1
+    local max_retries=3
+    local retry_count=0
+
+    while true; do
+        result=$(psql -h $DB_HOST -U $DB_USER -d $DB_NAME -t -c "$query" 2>>$LOG_FILE)
+        if [ $? -eq 0 ]; then
+            echo "$result"
+            break
+        else
+            log "Query failed, retrying... ($retry_count/$max_retries)"
+            ((retry_count++))
+            if [ $retry_count -gt $max_retries ]; then
+                log "Query failed after $max_retries retries. Exiting."
+                exit 1
+            fi
+            sleep 1
+        fi
+    done
+}
+
+echo "Enter the search string:"
+read search_string
+
+DBS=("platform" "commonsvcs" "operationsmanager" "lcm" "domainmanager")
+RESULT_FILE_PREFIX="/tmp/JOsearch_result_"
+
+for DB_NAME in "${DBS[@]}"; do
+    table_query="SELECT table_name FROM information_schema.tables WHERE table_schema='public' AND table_name NOT ILIKE '%task%';"
+    tables=$(run_query_with_retries "$table_query")
+
+    if [ -z "$tables" ]; then
+        log "No tables found in database $DB_NAME, skipping."
+        continue
+    fi
+
+    result_file="${RESULT_FILE_PREFIX}${DB_NAME}_$(date +"%Y%m%d%H%M%S").txt"
+    touch $result_file
+
+    for table in $tables; do
+        log "Searching in table: $table (Database: $DB_NAME)"
+
+        search_query="PREPARE search_query(text) AS SELECT * FROM $table WHERE to_tsvector('english', to_jsonb($table)) @@ plainto_tsquery('english', \$1);"
+        run_query_with_retries "$search_query"
+        result=$(run_query_with_retries "EXECUTE search_query('$search_string');")
+        psql -h $DB_HOST -U $DB_USER -d $DB_NAME -c "DEALLOCATE search_query;" 2>>$LOG_FILE
+
+        echo "Results for table $table (Database: $DB_NAME):" | tee -a $result_file
+        echo "$result" | tee -a $result_file
+        echo "--------------------------------------" | tee -a $result_file
+    done
+done
